@@ -42,6 +42,7 @@
 
 #define VENDOR_USB_ADB_DISABLED_PROP "vendor.sys.usb.adb.disabled"
 #define USB_CONTROLLER_PROP "vendor.usb.controller"
+#define USB_MODE_PATH "/sys/bus/platform/devices/"
 
 namespace android {
 namespace hardware {
@@ -730,6 +731,8 @@ static void handle_psy_uevent(Usb *usb, const char *msg)
 static void uevent_event(uint32_t /*epevents*/, struct data *payload) {
   char msg[UEVENT_MSG_LEN + 2];
   int n;
+  std::string dwc3_sysfs;
+
   std::string gadgetName = GetProperty(USB_CONTROLLER_PROP, "");
   static std::regex add_regex("add@(/devices/platform/soc/.*dwc3/xhci-hcd\\.\\d\\.auto/"
                               "usb\\d/\\d-\\d(?:/[\\d\\.-]+)*)");
@@ -737,6 +740,8 @@ static void uevent_event(uint32_t /*epevents*/, struct data *payload) {
                                "usb\\d/\\d-\\d(?:/[\\d\\.-]+)*)/([^/]*:[^/]*)");
   static std::regex udc_regex("(add|remove)@/devices/platform/soc/.*/" + gadgetName +
                               "/udc/" + gadgetName);
+  static std::regex offline_regex("offline@(/devices/platform/.*dwc3/xhci-hcd\\.\\d\\.auto/usb.*)");
+  static std::regex dwc3_regex("\\/(\\w+.\\w+usb)/.*dwc3");
 
   n = uevent_kernel_multicast_recv(payload->uevent_fd, msg, UEVENT_MSG_LEN);
   if (n <= 0) return;
@@ -784,7 +789,16 @@ static void uevent_event(uint32_t /*epevents*/, struct data *payload) {
       // Setting this property stops ADBD from proceeding with the retry.
       SetProperty(VENDOR_USB_ADB_DISABLED_PROP, "1");
     }
-  }
+  }  else if (std::regex_match(msg, match, offline_regex)) {
+	 if(std::regex_search (msg, match, dwc3_regex))
+	 {
+		 dwc3_sysfs = USB_MODE_PATH + match.str(1) + "/mode";
+		 ALOGE("ERROR:restarting in host mode");
+		 writeFile(dwc3_sysfs, "none");
+		 sleep(1);
+		 writeFile(dwc3_sysfs, "host");
+	 }
+ }
 }
 
 void *work(void *param) {
