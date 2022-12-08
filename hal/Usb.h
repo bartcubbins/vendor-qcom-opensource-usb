@@ -84,6 +84,14 @@ struct Usb : public BnUsb {
     std::string mPowerOpMode;
     // Path to get the status of contaminant presence
     std::string mContaminantStatusPath;
+    // Thread for disconnect monitor
+    std::thread mDisMon;
+    // Disconnect monitor is active or not
+    int monDisconnect;
+    // Conditions are fulfilled for a bus reset recovery
+    bool armResetRecovery;
+    // Audio device path for reset recovery
+    std::string audioDev;
 
   private:
     std::thread mPoll;

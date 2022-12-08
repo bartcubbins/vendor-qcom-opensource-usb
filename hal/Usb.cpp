@@ -71,6 +71,9 @@ static void checkUsbInHostMode();
 static void checkUsbDeviceAutoSuspend(const std::string& devicePath);
 static bool checkUsbInterfaceAutoSuspend(const std::string& devicePath,
         const std::string &intf);
+static bool isAudioClass(const std::string& devicePath,
+        const std::string &intf);
+static bool isRootHub(const std::string& devicePath);
 
 ScopedAStatus Usb::enableUsbData(const std::string& in_portName, bool in_enable,
     int64_t in_transactionId) {
@@ -598,6 +601,26 @@ static void handle_psy_uevent(Usb *usb, const char *msg)
   }
 }
 
+// USB audio device disconnect monitor
+void disconnectMon(struct Usb *usb) {
+  std::string devicePath = usb->audioDev;
+  int timeout = 300, ret;
+
+  while (usb->monDisconnect) {
+    if (!timeout) {
+      ALOGI("disconnectMon timed out, deauthorizing");
+      ret = WriteStringToFile("0", devicePath + "/../authorized");
+      if (!ret)
+        ALOGI("unable to deauthorize device");
+      break;
+    }
+    timeout--;
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+
+  return;
+}
+
 static void uevent_event(const unique_fd &uevent_fd, struct Usb *usb) {
   constexpr int UEVENT_MSG_LEN = 2048;
   char msg[UEVENT_MSG_LEN + 2];
@@ -607,7 +630,11 @@ static void uevent_event(const unique_fd &uevent_fd, struct Usb *usb) {
   std::string gadgetName = GetProperty(USB_CONTROLLER_PROP, "");
   static std::regex add_regex("add@(/devices/platform/soc/.*dwc3/xhci-hcd\\.\\d\\.auto/"
                               "usb\\d/\\d-\\d(?:/[\\d\\.-]+)*)");
+  static std::regex remove_regex("remove@((/devices/platform/soc/.*dwc3/xhci-hcd\\.\\d\\.auto/"
+                              "usb\\d)/\\d-\\d(?:/[\\d\\.-]+)*)");
   static std::regex bind_regex("bind@(/devices/platform/soc/.*dwc3/xhci-hcd\\.\\d\\.auto/"
+                               "usb\\d/\\d-\\d(?:/[\\d\\.-]+)*)/([^/]*:[^/]*)");
+  static std::regex unbind_regex("unbind@(/devices/platform/soc/.*dwc3/xhci-hcd\\.\\d\\.auto/"
                                "usb\\d/\\d-\\d(?:/[\\d\\.-]+)*)/([^/]*:[^/]*)");
   static std::regex udc_regex("(add|remove)@/devices/platform/soc/.*/" + gadgetName +
                               "/udc/" + gadgetName);
@@ -633,11 +660,23 @@ static void uevent_event(const unique_fd &uevent_fd, struct Usb *usb) {
       std::csub_match submatch = match[1];
       checkUsbDeviceAutoSuspend("/sys" +  submatch.str());
     }
-  } else if (!usb->mIgnoreWakeup && std::regex_match(msg, match, bind_regex)) {
-    if (match.size() == 3) {
-      std::csub_match devpath = match[1];
-      std::csub_match intfpath = match[2];
-      checkUsbInterfaceAutoSuspend("/sys" + devpath.str(), intfpath.str());
+  } else if (std::regex_match(msg, match, bind_regex)) {
+    std::csub_match devpath = match[1];
+    std::csub_match intfpath = match[2];
+    std::string dpath;
+
+    if (!usb->mIgnoreWakeup) {
+        if (match.size() == 3) {
+          checkUsbInterfaceAutoSuspend("/sys" + devpath.str(), intfpath.str());
+        }
+    }
+
+    dpath.assign("/sys" + devpath.str());
+    // Limit the audio path recovery to devices directly connected to the root hub.
+    // Save the device path to the audio device, which will trigger the recovery.
+    if (usb->audioDev == "" && isAudioClass(dpath, intfpath.str()) && isRootHub(dpath)) {
+       usb->audioDev.assign(dpath);
+       usb->armResetRecovery = true;
     }
   } else if (std::regex_match(msg, match, udc_regex)) {
     if (!strncmp(msg, "add", 3)) {
@@ -650,7 +689,6 @@ static void uevent_event(const unique_fd &uevent_fd, struct Usb *usb) {
         ALOGI("Binding UDC %s to ConfigFS", gadgetName.c_str());
         WriteStringToFile(gadgetName, "/config/usb_gadget/g1/UDC");
       }
-
     } else {
       // When the UDC is removed, the ConfigFS gadget will no longer be
       // bound. If ADBD is running it would keep opening/writing to its
@@ -669,7 +707,37 @@ static void uevent_event(const unique_fd &uevent_fd, struct Usb *usb) {
 		 sleep(1);
 		 WriteStringToFile("host", dwc3_sysfs);
 	 }
- }
+ } else if (std::regex_match(msg, match, unbind_regex)) {
+    std::csub_match devpath = match[1];
+    std::csub_match intfpath = match[2];
+    std::string dpath;
+
+    dpath.assign("/sys" + devpath.str());
+    // Limit the recovery to when an audio device is connected directly to
+    // the roothub.  A path reference is needed so other non-audio class
+    // related devices don't trigger the disconnectMon. (unbind uevent occurs
+    // after sysfs files are cleaned, can't check bInterfaceClass)
+    if (usb->armResetRecovery && usb->audioDev == dpath) {
+        usb->monDisconnect = 1;
+        usb->armResetRecovery = false;
+        usb->mDisMon = std::thread(&disconnectMon, usb);
+    }
+  } else if (std::regex_match(msg, match, remove_regex)) {
+    std::csub_match devpath = match[1];
+    std::csub_match parentpath = match[2];
+    std::string dpath;
+
+    dpath.assign("/sys" + devpath.str());
+    ALOGI("Disconnect received");
+    if (usb->monDisconnect) {
+      usb->monDisconnect = 0;
+      usb->mDisMon.join();
+      WriteStringToFile("1", "/sys" + parentpath.str() + "/authorized");
+    }
+    if (usb->audioDev == dpath)
+      usb->audioDev = "";
+    usb->armResetRecovery = false;
+  }
 }
 
 void Usb::uevent_work() {
@@ -898,6 +966,42 @@ static bool checkUsbWakeupSupport() {
   return ignoreWakeup;
 }
 
+static int getDeviceInterfaceClass(const std::string& devicePath,
+        const std::string &intf)
+{
+  std::string bInterfaceClass;
+  int ret;
+
+  ret = ReadFileToString(devicePath + "/" + intf + "/bInterfaceClass", &bInterfaceClass);
+  if (!ret || bInterfaceClass.length() == 0)
+    return -1;
+
+  return std::stoi(bInterfaceClass, 0, 16);
+}
+
+static bool isRootHub(const std::string& devicePath) {
+  std::string devpath;
+  int path;
+  bool ret;
+
+  ret = ReadFileToString(devicePath + "/../devpath", &devpath);
+  if (!ret || devpath.length() == 0)
+    return false;
+
+  path = std::stoi(devpath, 0, 16);
+
+  return !path;
+}
+
+static bool isAudioClass(const std::string& devicePath,
+        const std::string &intf) {
+  int interfaceClass, ret = -1;
+
+  interfaceClass = getDeviceInterfaceClass(devicePath, intf);
+
+  return (interfaceClass == USB_CLASS_AUDIO);
+}
+
 /*
  * allow specific USB device idProduct and idVendor to auto suspend
  */
@@ -939,18 +1043,10 @@ static void checkUsbDeviceAutoSuspend(const std::string& devicePath) {
 
 static bool checkUsbInterfaceAutoSuspend(const std::string& devicePath,
         const std::string &intf) {
-  std::string bInterfaceClass;
-  int interfaceClass, retry = 3;
+  int interfaceClass;
   bool ret = false;
 
-  do {
-    ReadFileToString(devicePath + "/" + intf + "/bInterfaceClass", &bInterfaceClass);
-  } while ((--retry > 0) && (bInterfaceClass.length() == 0));
-
-  if (bInterfaceClass.length() == 0) {
-	  return false;
-  }
-  interfaceClass = std::stoi(bInterfaceClass, 0, 16);
+  interfaceClass = getDeviceInterfaceClass(devicePath, intf);
 
   // allow autosuspend for certain class devices
   switch (interfaceClass) {
