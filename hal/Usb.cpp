@@ -19,7 +19,9 @@
 
 #define LOG_TAG "android.hardware.usb@1.2-service-qti"
 
+#include <android-base/file.h>
 #include <android-base/logging.h>
+#include <android-base/strings.h>
 #include <assert.h>
 #include <chrono>
 #include <dirent.h>
@@ -50,6 +52,10 @@ namespace usb {
 namespace V1_2 {
 namespace implementation {
 
+using ::android::base::Trim;
+using ::android::base::ReadFileToString;
+using ::android::base::WriteStringToFile;
+
 const char GOOGLE_USB_VENDOR_ID_STR[] = "18d1";
 const char GOOGLE_USBC_35_ADAPTER_UNPLUGGED_ID_STR[] = "5029";
 
@@ -61,50 +67,6 @@ static void checkUsbInHostMode(struct Usb *usb);
 static void checkUsbDeviceAutoSuspend(const std::string& devicePath);
 static bool checkUsbInterfaceAutoSuspend(const std::string& devicePath,
         const std::string &intf);
-
-static int32_t readFile(const std::string &filename, std::string *contents) {
-  FILE *fp;
-  ssize_t read = 0;
-  char *line = NULL;
-  size_t len = 0;
-
-  fp = fopen(filename.c_str(), "r");
-  if (fp != NULL) {
-    if ((read = getline(&line, &len, fp)) != -1) {
-      char *pos;
-      if ((pos = strchr(line, '\n')) != NULL) *pos = '\0';
-      *contents = line;
-    }
-    free(line);
-    fclose(fp);
-    return 0;
-  } else {
-    ALOGE("fopen failed in readFile %s, errno=%d", filename.c_str(), errno);
-  }
-
-  return -1;
-}
-
-static int32_t writeFile(const std::string &filename,
-                         const std::string &contents) {
-  FILE *fp;
-  int ret;
-
-  fp = fopen(filename.c_str(), "w");
-  if (fp != NULL) {
-    ret = fputs(contents.c_str(), fp);
-    fclose(fp);
-    if (ret == EOF) {
-      ALOGE("fputs failed in writeFile %s", filename.c_str());
-      return -1;
-    }
-    return 0;
-  } else {
-    ALOGE("fopen failed in writeFile %s, errno=%d", filename.c_str(), errno);
-  }
-
-  return -1;
-}
 
 std::string appendRoleNodeHelper(const std::string &portName,
                                  PortRoleType type) {
@@ -159,29 +121,15 @@ void extractRole(std::string *roleName) {
 void switchToDrp(const std::string &portName) {
   std::string filename =
       appendRoleNodeHelper(std::string(portName.c_str()), PortRoleType::MODE);
-  FILE *fp;
 
-  if (filename != "") {
-    fp = fopen(filename.c_str(), "w");
-    if (fp != NULL) {
-      int ret = fputs("dual", fp);
-      fclose(fp);
-      if (ret == EOF)
-        ALOGE("Fatal: Error while switching back to drp");
-    } else {
-      ALOGE("Fatal: Cannot open file to switch back to drp");
-    }
-  } else {
-    ALOGE("Fatal: invalid node type");
-  }
+  if (!WriteStringToFile("dual", filename))
+    ALOGE("Fatal: Error while switching back to drp");
 }
 
 bool switchMode(const hidl_string &portName,
                              const PortRole &newRole, struct Usb *usb) {
   std::string filename =
        appendRoleNodeHelper(std::string(portName.c_str()), newRole.type);
-  std::string written;
-  FILE *fp;
   bool roleSwitch = false;
 
   if (filename == "") {
@@ -189,17 +137,13 @@ bool switchMode(const hidl_string &portName,
     return false;
   }
 
-  fp = fopen(filename.c_str(), "w");
-  if (fp != NULL) {
+  {
     // Hold the lock here to prevent loosing connected signals
     // as once the file is written the partner added signal
     // can arrive anytime.
     pthread_mutex_lock(&usb->mPartnerLock);
     usb->mPartnerUp = false;
-    int ret = fputs(convertRoletoString(newRole).c_str(), fp);
-    fclose(fp);
-
-    if (ret != EOF) {
+    if (WriteStringToFile(convertRoletoString(newRole), filename)) {
       struct timespec   to;
       struct timespec   now;
 
@@ -220,7 +164,7 @@ wait_again:
         roleSwitch = true;
       }
     } else {
-      ALOGI("Role switch failed while wrting to file");
+      ALOGI("Role switch failed while writing to file");
     }
     pthread_mutex_unlock(&usb->mPartnerLock);
   }
@@ -263,7 +207,6 @@ Return<void> Usb::switchRole(const hidl_string &portName,
   std::string filename =
       appendRoleNodeHelper(std::string(portName.c_str()), newRole.type);
   std::string written;
-  FILE *fp;
   bool roleSwitch = false;
 
   if (filename == "") {
@@ -279,11 +222,8 @@ Return<void> Usb::switchRole(const hidl_string &portName,
   if (newRole.type == PortRoleType::MODE) {
       roleSwitch = switchMode(portName, newRole, this);
   } else {
-    fp = fopen(filename.c_str(), "w");
-    if (fp != NULL) {
-      int ret = fputs(convertRoletoString(newRole).c_str(), fp);
-      fclose(fp);
-      if ((ret != EOF) && !readFile(filename, &written)) {
+    if (WriteStringToFile(convertRoletoString(newRole), filename)) {
+      if (ReadFileToString(filename, &written)) {
         extractRole(&written);
         ALOGI("written: %s", written.c_str());
         if (written == convertRoletoString(newRole)) {
@@ -292,10 +232,10 @@ Return<void> Usb::switchRole(const hidl_string &portName,
           ALOGE("Role switch failed");
         }
       } else {
-        ALOGE("failed to update the new role");
+        ALOGE("Unable to read back the new role");
       }
     } else {
-      ALOGE("fopen failed");
+      ALOGE("Role switch failed while writing to file");
     }
   }
 
@@ -319,12 +259,13 @@ Status getAccessoryConnected(const std::string &portName, std::string *accessory
   std::string filename =
     "/sys/class/typec/" + portName + "-partner/accessory_mode";
 
-  if (readFile(filename, accessory)) {
+  if (!ReadFileToString(filename, accessory)) {
     ALOGE("getAccessoryConnected: Failed to open filesystem node: %s",
           filename.c_str());
     return Status::ERROR;
   }
 
+  *accessory = Trim(*accessory);
   return Status::SUCCESS;
 }
 
@@ -364,7 +305,7 @@ Status getCurrentRoleHelper(const std::string &portName, bool connected,
     }
   }
 
-  if (readFile(filename, &roleName)) {
+  if (!ReadFileToString(filename, &roleName)) {
     ALOGE("getCurrentRole: Failed to open filesystem node: %s",
           filename.c_str());
     return Status::ERROR;
@@ -429,8 +370,8 @@ bool canSwitchRoleHelper(const std::string &portName, PortRoleType /*type*/) {
       "/sys/class/typec/" + portName + "-partner/supports_usb_power_delivery";
   std::string supportsPD;
 
-  if (!readFile(filename, &supportsPD)) {
-    if (supportsPD == "yes") {
+  if (ReadFileToString(filename, &supportsPD)) {
+    if (supportsPD[0] == 'y') {
       return true;
     }
   }
@@ -523,8 +464,8 @@ Status getPortStatusHelper(hidl_vec<PortStatus> *currentPortStatus_1_2,
         std::string contaminantPresence;
 
         if (!usb->mContaminantStatusPath.empty() &&
-                                !readFile(usb->mContaminantStatusPath, &contaminantPresence)) {
-          if (contaminantPresence == "1") {
+                ReadFileToString(usb->mContaminantStatusPath, &contaminantPresence)) {
+          if (contaminantPresence[0] == '1') {
             (*currentPortStatus_1_2)[i].contaminantDetectionStatus =
                 ContaminantDetectionStatus::DETECTED;
             ALOGI("moisture: Contaminant presence detected");
@@ -647,18 +588,19 @@ static void handle_typec_uevent(Usb *usb, const char *msg)
   }
 
   std::string power_operation_mode;
-  if (!readFile("/sys/class/typec/port0/power_operation_mode", &power_operation_mode)) {
+  if (ReadFileToString("/sys/class/typec/port0/power_operation_mode", &power_operation_mode)) {
+    power_operation_mode = Trim(power_operation_mode);
     if (usb->mPowerOpMode == power_operation_mode) {
       ALOGI("uevent recieved for same device %s", power_operation_mode.c_str());
     } else if(power_operation_mode == "usb_power_delivery") {
-      readFile("/config/usb_gadget/g1/configs/b.1/MaxPower", &usb->mMaxPower);
-      readFile("/config/usb_gadget/g1/configs/b.1/bmAttributes", &usb->mAttributes);
-      writeFile("/config/usb_gadget/g1/configs/b.1/MaxPower", "0");
-      writeFile("/config/usb_gadget/g1/configs/b.1/bmAttributes", "0xc0");
+      ReadFileToString("/config/usb_gadget/g1/configs/b.1/MaxPower", &usb->mMaxPower);
+      ReadFileToString("/config/usb_gadget/g1/configs/b.1/bmAttributes", &usb->mAttributes);
+      WriteStringToFile("0", "/config/usb_gadget/g1/configs/b.1/MaxPower");
+      WriteStringToFile("0xc0", "/config/usb_gadget/g1/configs/b.1/bmAttributes");
     } else {
       if(!usb->mMaxPower.empty()) {
-        writeFile("/config/usb_gadget/g1/configs/b.1/MaxPower", usb->mMaxPower.c_str());
-        writeFile("/config/usb_gadget/g1/configs/b.1/bmAttributes", usb->mAttributes.c_str());
+        WriteStringToFile(usb->mMaxPower, "/config/usb_gadget/g1/configs/b.1/MaxPower");
+        WriteStringToFile(usb->mAttributes, "/config/usb_gadget/g1/configs/b.1/bmAttributes");
         usb->mMaxPower = "";
       }
     }
@@ -699,7 +641,7 @@ static void handle_psy_uevent(Usb *usb, const char *msg)
 
   // read moisture detection status from sysfs
   if (usb->mContaminantStatusPath.empty() ||
-        readFile(usb->mContaminantStatusPath, &contaminantPresence))
+        !ReadFileToString(usb->mContaminantStatusPath, &contaminantPresence))
     return;
 
   moisture_detected = (contaminantPresence[0] == '1');
@@ -778,7 +720,7 @@ static void uevent_event(uint32_t /*epevents*/, struct data *payload) {
       // ConfigFS since ADBD is not there to trigger it (sys.usb.ffs.ready=1)
       if (GetProperty("init.svc.adbd", "") != "running") {
         ALOGI("Binding UDC %s to ConfigFS", gadgetName.c_str());
-        writeFile("/config/usb_gadget/g1/UDC", gadgetName);
+        WriteStringToFile(gadgetName, "/config/usb_gadget/g1/UDC");
       }
 
     } else {
@@ -795,9 +737,9 @@ static void uevent_event(uint32_t /*epevents*/, struct data *payload) {
 	 {
 		 dwc3_sysfs = USB_MODE_PATH + match.str(1) + "/mode";
 		 ALOGE("ERROR:restarting in host mode");
-		 writeFile(dwc3_sysfs, "none");
+		 WriteStringToFile("none", dwc3_sysfs);
 		 sleep(1);
-		 writeFile(dwc3_sysfs, "host");
+		 WriteStringToFile("host", dwc3_sysfs);
 	 }
  }
 }
@@ -1052,11 +994,11 @@ static bool canProductAutoSuspend(const std::string &deviceIdVendor,
 static bool canUsbDeviceAutoSuspend(const std::string &devicePath) {
   std::string deviceIdVendor;
   std::string deviceIdProduct;
-  readFile(devicePath + "/idVendor", &deviceIdVendor);
-  readFile(devicePath + "/idProduct", &deviceIdProduct);
+  ReadFileToString(devicePath + "/idVendor", &deviceIdVendor);
+  ReadFileToString(devicePath + "/idProduct", &deviceIdProduct);
 
-  // deviceIdVendor and deviceIdProduct will be empty strings if readFile fails
-  return canProductAutoSuspend(deviceIdVendor, deviceIdProduct);
+  // deviceIdVendor and deviceIdProduct will be empty strings if ReadFileToString fails
+  return canProductAutoSuspend(Trim(deviceIdVendor), Trim(deviceIdProduct));
 }
 
 /*
@@ -1071,19 +1013,19 @@ static void checkUsbDeviceAutoSuspend(const std::string& devicePath) {
    */
   if (canUsbDeviceAutoSuspend(devicePath)) {
     ALOGI("auto suspend usb device %s", devicePath.c_str());
-    writeFile(devicePath + "/power/control", "auto");
-    writeFile(devicePath + "/power/wakeup", "enabled");
+    WriteStringToFile("auto", devicePath + "/power/control");
+    WriteStringToFile("enabled", devicePath + "/power/wakeup");
   }
 }
 
 static bool checkUsbInterfaceAutoSuspend(const std::string& devicePath,
         const std::string &intf) {
   std::string bInterfaceClass;
-  int interfaceClass, ret = -1, retry = 3;
+  int interfaceClass, retry = 3;
+  bool ret = false;
 
   do {
-	  readFile(devicePath + "/" + intf + "/bInterfaceClass",
-			  &bInterfaceClass);
+    ReadFileToString(devicePath + "/" + intf + "/bInterfaceClass", &bInterfaceClass);
   } while ((--retry > 0) && (bInterfaceClass.length() == 0));
 
   if (bInterfaceClass.length() == 0) {
@@ -1096,18 +1038,18 @@ static bool checkUsbInterfaceAutoSuspend(const std::string& devicePath,
     case USB_CLASS_AUDIO:
     case USB_CLASS_HUB:
       ALOGI("auto suspend usb interfaces %s", devicePath.c_str());
-      ret = writeFile(devicePath + "/power/control", "auto");
-      if (ret)
+      ret = WriteStringToFile("auto", devicePath + "/power/control");
+      if (!ret)
         break;
 
-      ret = writeFile(devicePath + "/power/wakeup", "enabled");
+      ret = WriteStringToFile("enabled", devicePath + "/power/wakeup");
       break;
      default:
       ALOGI("usb interface does not support autosuspend %s", devicePath.c_str());
 
   }
 
-  return ret ? false : true;
+  return ret;
 }
 
 }  // namespace implementation
