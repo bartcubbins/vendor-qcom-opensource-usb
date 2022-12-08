@@ -62,8 +62,8 @@ const char GOOGLE_USBC_35_ADAPTER_UNPLUGGED_ID_STR[] = "5029";
 // Set by the signal handler to destroy the thread
 volatile bool destroyThread;
 
-static void checkUsbWakeupSupport(struct Usb *usb);
-static void checkUsbInHostMode(struct Usb *usb);
+static bool checkUsbWakeupSupport();
+static void checkUsbInHostMode();
 static void checkUsbDeviceAutoSuspend(const std::string& devicePath);
 static bool checkUsbInterfaceAutoSuspend(const std::string& devicePath,
         const std::string &intf);
@@ -126,8 +126,7 @@ void switchToDrp(const std::string &portName) {
     ALOGE("Fatal: Error while switching back to drp");
 }
 
-bool switchMode(const hidl_string &portName,
-                             const PortRole &newRole, struct Usb *usb) {
+bool Usb::switchMode(const hidl_string &portName, const PortRole &newRole) {
   std::string filename =
        appendRoleNodeHelper(std::string(portName.c_str()), newRole.type);
   bool roleSwitch = false;
@@ -141,8 +140,8 @@ bool switchMode(const hidl_string &portName,
     // Hold the lock here to prevent loosing connected signals
     // as once the file is written the partner added signal
     // can arrive anytime.
-    pthread_mutex_lock(&usb->mPartnerLock);
-    usb->mPartnerUp = false;
+    pthread_mutex_lock(&mPartnerLock);
+    mPartnerUp = false;
     if (WriteStringToFile(convertRoletoString(newRole), filename)) {
       struct timespec   to;
       struct timespec   now;
@@ -152,12 +151,12 @@ wait_again:
       to.tv_sec = now.tv_sec + PORT_TYPE_TIMEOUT;
       to.tv_nsec = now.tv_nsec;
 
-      int err = pthread_cond_timedwait(&usb->mPartnerCV, &usb->mPartnerLock, &to);
+      int err = pthread_cond_timedwait(&mPartnerCV, &mPartnerLock, &to);
       // There are no uevent signals which implies role swap timed out.
       if (err == ETIMEDOUT) {
         ALOGI("uevents wait timedout");
       // Sanity check.
-      } else if (!usb->mPartnerUp) {
+      } else if (!mPartnerUp) {
         goto wait_again;
       // Role switch succeeded since usb->mPartnerUp is true.
       } else {
@@ -166,7 +165,7 @@ wait_again:
     } else {
       ALOGI("Role switch failed while writing to file");
     }
-    pthread_mutex_unlock(&usb->mPartnerLock);
+    pthread_mutex_unlock(&mPartnerLock);
   }
 
   if (!roleSwitch)
@@ -220,7 +219,7 @@ Return<void> Usb::switchRole(const hidl_string &portName,
         convertRoletoString(newRole).c_str());
 
   if (newRole.type == PortRoleType::MODE) {
-      roleSwitch = switchMode(portName, newRole, this);
+      roleSwitch = switchMode(portName, newRole);
   } else {
     if (WriteStringToFile(convertRoletoString(newRole), filename)) {
       if (ReadFileToString(filename, &written)) {
@@ -384,7 +383,7 @@ bool canSwitchRoleHelper(const std::string &portName, PortRoleType /*type*/) {
  * object if required.
  */
 Status getPortStatusHelper(hidl_vec<PortStatus> *currentPortStatus_1_2,
-    bool V1_0, struct Usb *usb) {
+    bool V1_0, const std::string &contaminantStatusPath) {
   std::unordered_map<std::string, bool> names;
   Status result = getTypeCPortNamesHelper(&names);
   int i = -1;
@@ -463,8 +462,8 @@ Status getPortStatusHelper(hidl_vec<PortStatus> *currentPortStatus_1_2,
 
         std::string contaminantPresence;
 
-        if (!usb->mContaminantStatusPath.empty() &&
-                ReadFileToString(usb->mContaminantStatusPath, &contaminantPresence)) {
+        if (!contaminantStatusPath.empty() &&
+                ReadFileToString(contaminantStatusPath, &contaminantPresence)) {
           if (contaminantPresence[0] == '1') {
             (*currentPortStatus_1_2)[i].contaminantDetectionStatus =
                 ContaminantDetectionStatus::DETECTED;
@@ -500,15 +499,18 @@ Return<void> Usb::queryPortStatus() {
   if (mCallback_1_0 != NULL) {
     if (callback_V1_1 != NULL) { // 1.1 or 1.2
       if (callback_V1_2 == NULL) { // 1.1 only
-        status = getPortStatusHelper(&currentPortStatus_1_2, false, this);
+        status = getPortStatusHelper(&currentPortStatus_1_2, false,
+                mContaminantStatusPath);
         currentPortStatus_1_1.resize(currentPortStatus_1_2.size());
         for (unsigned long i = 0; i < currentPortStatus_1_2.size(); i++)
           currentPortStatus_1_1[i].status = currentPortStatus_1_2[i].status_1_1.status;
       }
       else  //1.2 only
-        status = getPortStatusHelper(&currentPortStatus_1_2, false, this);
+        status = getPortStatusHelper(&currentPortStatus_1_2, false,
+                mContaminantStatusPath);
     } else { // 1.0 only
-      status = getPortStatusHelper(&currentPortStatus_1_2, true, this);
+      status = getPortStatusHelper(&currentPortStatus_1_2, true,
+              mContaminantStatusPath);
       currentPortStatus.resize(currentPortStatus_1_2.size());
       for (unsigned long i = 0; i < currentPortStatus_1_2.size(); i++)
         currentPortStatus[i] = currentPortStatus_1_2[i].status_1_1.status;
@@ -544,7 +546,8 @@ Return<void> callbackNotifyPortStatusChangeHelper(struct Usb *usb) {
   sp<IUsbCallback> callback_V1_2 = IUsbCallback::castFrom(usb->mCallback_1_0);
 
   pthread_mutex_lock(&usb->mLock);
-  status = getPortStatusHelper(&currentPortStatus_1_2, false, usb);
+  status = getPortStatusHelper(&currentPortStatus_1_2, false,
+          usb->mContaminantStatusPath);
   ret = callback_V1_2->notifyPortStatusChange_1_2(currentPortStatus_1_2, status);
 
   if (!ret.isOk())
@@ -649,7 +652,8 @@ static void handle_psy_uevent(Usb *usb, const char *msg)
   if (usb->mContaminantPresence != moisture_detected) {
     usb->mContaminantPresence = moisture_detected;
 
-    status = getPortStatusHelper(&currentPortStatus_1_2, false, usb);
+    status = getPortStatusHelper(&currentPortStatus_1_2, false,
+            usb->mContaminantStatusPath);
     ret = callback_V1_2->notifyPortStatusChange_1_2(currentPortStatus_1_2, status);
     if (!ret.isOk()) ALOGE("error %s", ret.description().c_str());
   }
@@ -868,8 +872,8 @@ Return<void> Usb::setCallback(const sp<V1_0::IUsbCallback> &callback) {
 
   pthread_mutex_unlock(&mLock);
 
-  checkUsbWakeupSupport(this);
-  checkUsbInHostMode(this);
+  mIgnoreWakeup = checkUsbWakeupSupport();
+  checkUsbInHostMode();
 
   /*
    * Check for the correct path to detect contaminant presence status
@@ -891,16 +895,16 @@ Return<void> Usb::setCallback(const sp<V1_0::IUsbCallback> &callback) {
   return Void();
 }
 
-static void checkUsbInHostMode(struct Usb *usb) {
+static void checkUsbInHostMode() {
   std::string gadgetName = "/sys/bus/platform/devices/" + GetProperty(USB_CONTROLLER_PROP, "");
   DIR *gd = opendir(gadgetName.c_str());
   if (gd != NULL) {
     struct dirent *gadgetDir;
     while ((gadgetDir = readdir(gd))) {
       if (strstr(gadgetDir->d_name, "xhci-hcd")) {
-	SetProperty(VENDOR_USB_ADB_DISABLED_PROP, "1");
-	closedir(gd);
-	return;
+        SetProperty(VENDOR_USB_ADB_DISABLED_PROP, "1");
+        closedir(gd);
+        return;
       }
     }
     closedir(gd);
@@ -908,9 +912,11 @@ static void checkUsbInHostMode(struct Usb *usb) {
   SetProperty(VENDOR_USB_ADB_DISABLED_PROP, "0");
 }
 
-static void checkUsbWakeupSupport(struct Usb *usb) {
+static bool checkUsbWakeupSupport() {
   std::string platdevices = "/sys/bus/platform/devices/";
   DIR *pd = opendir(platdevices.c_str());
+  bool ignoreWakeup = true;
+
   if (pd != NULL) {
     struct dirent *platDir;
     while ((platDir = readdir(pd))) {
@@ -921,20 +927,20 @@ static void checkUsbWakeupSupport(struct Usb *usb) {
        * power/wakeup node.
        */
       if (strstr(platDir->d_name, "susb")) {
-	if (faccessat(dirfd(pd), (cname + "/power/wakeup").c_str(), F_OK, 0) < 0) {
-	  usb->mIgnoreWakeup = true;
-	  ALOGI("PLATFORM DOESN'T SUPPORT WAKEUP");
-	} else {
-	  usb->mIgnoreWakeup = false;
-	}
-	break;
+        if (faccessat(dirfd(pd), (cname + "/power/wakeup").c_str(), F_OK, 0) < 0) {
+          ignoreWakeup = true;
+          ALOGI("PLATFORM DOESN'T SUPPORT WAKEUP");
+        } else {
+          ignoreWakeup = false;
+        }
+        break;
       }
     }
     closedir(pd);
   }
 
-  if (usb->mIgnoreWakeup)
-    return;
+  if (ignoreWakeup)
+    return true;
 
   /*
    * If wakeup is supported then scan for enumerated USB devices and
@@ -977,6 +983,8 @@ static void checkUsbWakeupSupport(struct Usb *usb) {
     }
     closedir(dp);
   }
+
+  return ignoreWakeup;
 }
 
 /*

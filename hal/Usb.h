@@ -79,8 +79,9 @@ struct Usb : public IUsb {
     // Path to get the status of contaminant presence
     std::string mContaminantStatusPath;
 
-    private:
-        pthread_t mPoll;
+  private:
+    pthread_t mPoll;
+    bool switchMode(const hidl_string &portName, const PortRole &newRole);
 };
 
 }  // namespace implementation
