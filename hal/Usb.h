@@ -7,13 +7,10 @@
 #include <hidl/Status.h>
 #include <utils/Log.h>
 #include <android-base/properties.h>
-
-#define UEVENT_MSG_LEN 2048
-// The type-c stack waits for 4.5 - 5.5 secs before declaring a port non-pd.
-// The -partner directory would not be created until this is done.
-// Having a margin of ~3 secs for the directory and other related bookeeping
-// structures created and uvent fired.
-#define PORT_TYPE_TIMEOUT 8
+#include <android-base/unique_fd.h>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
 
 namespace android {
 namespace hardware {
@@ -44,6 +41,7 @@ using ::android::hardware::Return;
 using ::android::hardware::Void;
 using ::android::base::SetProperty;
 using ::android::base::GetProperty;
+using ::android::base::unique_fd;
 using ::android::sp;
 
 struct Usb : public IUsb {
@@ -57,13 +55,13 @@ struct Usb : public IUsb {
 
     sp<V1_0::IUsbCallback> mCallback_1_0;
     // Protects mCallback variable
-    pthread_mutex_t mLock;
+    std::mutex mLock;
     // Protects roleSwitch operation
-    pthread_mutex_t mRoleSwitchLock;
+    std::mutex mRoleSwitchLock;
     // Threads waiting for the partner to come back wait here
-    pthread_cond_t mPartnerCV;
+    std::condition_variable mPartnerCV;
     // lock protecting mPartnerCV
-    pthread_mutex_t mPartnerLock;
+    std::mutex mPartnerLock;
     // Variable to signal partner coming back online after type switch
     bool mPartnerUp;
     // Variable to indicate presence or absence or contaminant
@@ -80,7 +78,9 @@ struct Usb : public IUsb {
     std::string mContaminantStatusPath;
 
   private:
-    pthread_t mPoll;
+    std::thread mPoll;
+    unique_fd mEventFd;
+    void uevent_work();
     bool switchMode(const hidl_string &portName, const PortRole &newRole);
 };
 

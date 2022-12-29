@@ -25,9 +25,9 @@
 #include <assert.h>
 #include <chrono>
 #include <dirent.h>
-#include <pthread.h>
 #include <regex>
 #include <stdio.h>
+#include <sys/eventfd.h>
 #include <sys/types.h>
 #include <thread>
 #include <unistd.h>
@@ -58,9 +58,6 @@ using ::android::base::WriteStringToFile;
 
 const char GOOGLE_USB_VENDOR_ID_STR[] = "18d1";
 const char GOOGLE_USBC_35_ADAPTER_UNPLUGGED_ID_STR[] = "5029";
-
-// Set by the signal handler to destroy the thread
-volatile bool destroyThread;
 
 static bool checkUsbWakeupSupport();
 static void checkUsbInHostMode();
@@ -143,66 +140,37 @@ bool Usb::switchMode(const hidl_string &portName, const PortRole &newRole) {
     // Hold the lock here to prevent loosing connected signals
     // as once the file is written the partner added signal
     // can arrive anytime.
-    pthread_mutex_lock(&mPartnerLock);
+    std::unique_lock lock(mPartnerLock);
     mPartnerUp = false;
     if (WriteStringToFile(convertRoletoString(newRole), filename)) {
-      struct timespec   to;
-      struct timespec   now;
+      // The type-c stack waits for 4.5 - 5.5 secs before declaring a port non-pd.
+      // The -partner directory would not be created until this is done.
+      // Having a margin of ~3 secs for the directory and other related bookeeping
+      // structures created and uvent fired.
+      constexpr std::chrono::seconds port_timeout(8);
 
 wait_again:
-      clock_gettime(CLOCK_MONOTONIC, &now);
-      to.tv_sec = now.tv_sec + PORT_TYPE_TIMEOUT;
-      to.tv_nsec = now.tv_nsec;
-
-      int err = pthread_cond_timedwait(&mPartnerCV, &mPartnerLock, &to);
-      // There are no uevent signals which implies role swap timed out.
-      if (err == ETIMEDOUT) {
+      if (mPartnerCV.wait_for(lock, port_timeout) == std::cv_status::timeout) {
+        // There are no uevent signals which implies role swap timed out.
         ALOGI("uevents wait timedout");
-      // Sanity check.
-      } else if (!mPartnerUp) {
+      } else if (!mPartnerUp) { // Sanity check.
         goto wait_again;
-      // Role switch succeeded since usb->mPartnerUp is true.
       } else {
+        // Role switch succeeded since usb->mPartnerUp is true.
         roleSwitch = true;
       }
     } else {
       ALOGI("Role switch failed while writing to file");
     }
-    pthread_mutex_unlock(&mPartnerLock);
   }
 
   if (!roleSwitch)
-    switchToDrp(std::string(portName.c_str()));
+    switchToDrp(portName);
 
   return roleSwitch;
 }
 
-Usb::Usb()
-        : mLock(PTHREAD_MUTEX_INITIALIZER),
-          mRoleSwitchLock(PTHREAD_MUTEX_INITIALIZER),
-          mPartnerLock(PTHREAD_MUTEX_INITIALIZER),
-          mPartnerUp(false),
-          mContaminantPresence(false) {
-    pthread_condattr_t attr;
-    if (pthread_condattr_init(&attr)) {
-        ALOGE("pthread_condattr_init failed: %s", strerror(errno));
-        abort();
-    }
-    if (pthread_condattr_setclock(&attr, CLOCK_MONOTONIC)) {
-        ALOGE("pthread_condattr_setclock failed: %s", strerror(errno));
-        abort();
-    }
-    if (pthread_cond_init(&mPartnerCV, &attr))  {
-        ALOGE("pthread_cond_init failed: %s", strerror(errno));
-        abort();
-    }
-    if (pthread_condattr_destroy(&attr)) {
-        ALOGE("pthread_condattr_destroy failed: %s", strerror(errno));
-        abort();
-    }
-
-}
-
+Usb::Usb() : mPartnerUp(false), mContaminantPresence(false) { }
 
 Return<void> Usb::switchRole(const hidl_string &portName,
                              const V1_0::PortRole &newRole) {
@@ -216,7 +184,7 @@ Return<void> Usb::switchRole(const hidl_string &portName,
     return Void();
   }
 
-  pthread_mutex_lock(&mRoleSwitchLock);
+  std::scoped_lock role_lock(mRoleSwitchLock);
 
   ALOGI("filename write: %s role:%s", filename.c_str(), convertRoletoString(newRole));
 
@@ -240,7 +208,7 @@ Return<void> Usb::switchRole(const hidl_string &portName,
     }
   }
 
-  pthread_mutex_lock(&mLock);
+  std::scoped_lock lock(mLock);
   if (mCallback_1_0 != NULL) {
     Return<void> ret =
         mCallback_1_0->notifyRoleSwitchStatus(portName, newRole,
@@ -250,8 +218,6 @@ Return<void> Usb::switchRole(const hidl_string &portName,
   } else {
     ALOGE("Not notifying the userspace. Callback is not set");
   }
-  pthread_mutex_unlock(&mLock);
-  pthread_mutex_unlock(&mRoleSwitchLock);
 
   return Void();
 }
@@ -485,7 +451,7 @@ Return<void> Usb::queryPortStatus() {
   sp<IUsbCallback> callback_V1_2 = IUsbCallback::castFrom(mCallback_1_0);
   sp<V1_1::IUsbCallback> callback_V1_1 = V1_1::IUsbCallback::castFrom(mCallback_1_0);
 
-  pthread_mutex_lock(&mLock);
+  std::scoped_lock lock(mLock);
   if (mCallback_1_0 != NULL) {
     if (callback_V1_1 != NULL) { // 1.1 or 1.2
       if (callback_V1_2 == NULL) { // 1.1 only
@@ -520,7 +486,7 @@ Return<void> Usb::queryPortStatus() {
   } else {
     ALOGI("Notifying userspace skipped. Callback is NULL");
   }
-  pthread_mutex_unlock(&mLock);
+
   return Void();
 }
 
@@ -535,7 +501,7 @@ Return<void> callbackNotifyPortStatusChangeHelper(struct Usb *usb) {
   Return<void> ret;
   sp<IUsbCallback> callback_V1_2 = IUsbCallback::castFrom(usb->mCallback_1_0);
 
-  pthread_mutex_lock(&usb->mLock);
+  std::scoped_lock lock(usb->mLock);
   status = getPortStatusHelper(currentPortStatus_1_2, false,
           usb->mContaminantStatusPath);
   ret = callback_V1_2->notifyPortStatusChange_1_2(currentPortStatus_1_2, status);
@@ -543,7 +509,6 @@ Return<void> callbackNotifyPortStatusChangeHelper(struct Usb *usb) {
   if (!ret.isOk())
     ALOGE("notifyPortStatusChange_1_2 error %s", ret.description().c_str());
 
-  pthread_mutex_unlock(&usb->mLock);
   return Void();
 }
 
@@ -574,10 +539,9 @@ static void handle_typec_uevent(Usb *usb, const char *msg)
   // if (std::regex_match(cp, std::regex("(add)(.*)(-partner)")))
   if (!strncmp(msg, "add@", 4) && !strncmp(msg + strlen(msg) - 8, "-partner", 8)) {
      ALOGI("partner added");
-     pthread_mutex_lock(&usb->mPartnerLock);
+     std::scoped_lock lock(usb->mPartnerLock);
      usb->mPartnerUp = true;
-     pthread_cond_signal(&usb->mPartnerCV);
-     pthread_mutex_unlock(&usb->mPartnerLock);
+     usb->mPartnerCV.notify_one();
   }
 
   std::string power_operation_mode;
@@ -649,7 +613,8 @@ static void handle_psy_uevent(Usb *usb, const char *msg)
   }
 
   //Role switch is not in progress and port is in disconnected state
-  if (!pthread_mutex_trylock(&usb->mRoleSwitchLock)) {
+  std::unique_lock role_lock(usb->mRoleSwitchLock, std::defer_lock);
+  if (role_lock.try_lock()) {
     for (unsigned long i = 0; i < currentPortStatus_1_2.size(); i++) {
       DIR *dp = opendir(std::string("/sys/class/typec/"
           + std::string(currentPortStatus_1_2[i].status_1_1.status.portName.c_str())
@@ -661,11 +626,11 @@ static void handle_psy_uevent(Usb *usb, const char *msg)
         closedir(dp);
       }
     }
-    pthread_mutex_unlock(&usb->mRoleSwitchLock);
   }
 }
 
-static void uevent_event(uint32_t /*epevents*/, struct data *payload) {
+static void uevent_event(const unique_fd &uevent_fd, struct Usb *usb) {
+  constexpr int UEVENT_MSG_LEN = 2048;
   char msg[UEVENT_MSG_LEN + 2];
   int n;
   std::string dwc3_sysfs;
@@ -680,7 +645,7 @@ static void uevent_event(uint32_t /*epevents*/, struct data *payload) {
   static std::regex offline_regex("offline@(/devices/platform/.*dwc3/xhci-hcd\\.\\d\\.auto/usb.*)");
   static std::regex dwc3_regex("\\/(\\w+.\\w+usb)/.*dwc3");
 
-  n = uevent_kernel_multicast_recv(payload->uevent_fd, msg, UEVENT_MSG_LEN);
+  n = uevent_kernel_multicast_recv(uevent_fd.get(), msg, UEVENT_MSG_LEN);
   if (n <= 0) return;
   if (n >= UEVENT_MSG_LEN) /* overflow -- discard */
     return;
@@ -691,15 +656,15 @@ static void uevent_event(uint32_t /*epevents*/, struct data *payload) {
   std::cmatch match;
 
   if (strstr(msg, "typec/port")) {
-    handle_typec_uevent(payload->usb, msg);
+    handle_typec_uevent(usb, msg);
   } else if (strstr(msg, "power_supply/usb")) {
-    handle_psy_uevent(payload->usb, msg + strlen(msg) + 1);
+    handle_psy_uevent(usb, msg + strlen(msg) + 1);
   } else if (std::regex_match(msg, match, add_regex)) {
     if (match.size() == 2) {
       std::csub_match submatch = match[1];
       checkUsbDeviceAutoSuspend("/sys" +  submatch.str());
     }
-  } else if (!payload->usb->mIgnoreWakeup && std::regex_match(msg, match, bind_regex)) {
+  } else if (!usb->mIgnoreWakeup && std::regex_match(msg, match, bind_regex)) {
     if (match.size() == 3) {
       std::csub_match devpath = match[1];
       std::csub_match intfpath = match[2];
@@ -738,41 +703,50 @@ static void uevent_event(uint32_t /*epevents*/, struct data *payload) {
  }
 }
 
-static void *work(void *param) {
-  int epoll_fd, uevent_fd;
+void Usb::uevent_work() {
   struct epoll_event ev;
   int nevents = 0;
-  struct data payload;
 
   ALOGE("creating thread");
 
-  uevent_fd = uevent_open_socket(64 * 1024, true);
+  unique_fd uevent_fd(uevent_open_socket(64 * 1024, true));
 
   if (uevent_fd < 0) {
     ALOGE("uevent_init: uevent_open_socket failed\n");
-    return NULL;
+    return;
   }
 
-  payload.uevent_fd = uevent_fd;
-  payload.usb = (android::hardware::usb::V1_2::implementation::Usb *)param;
+  fcntl(uevent_fd.get(), F_SETFL, O_NONBLOCK);
 
-  fcntl(uevent_fd, F_SETFL, O_NONBLOCK);
-
-  ev.events = EPOLLIN;
-  ev.data.ptr = (void *)uevent_event;
-
-  epoll_fd = epoll_create(64);
+  unique_fd epoll_fd(epoll_create(64));
   if (epoll_fd == -1) {
     ALOGE("epoll_create failed; errno=%d", errno);
-    goto error;
+    return;
   }
 
+  ev.events = EPOLLIN;
+  ev.data.fd = uevent_fd.get();
   if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, uevent_fd, &ev) == -1) {
-    ALOGE("epoll_ctl failed; errno=%d", errno);
-    goto error;
+    ALOGE("epoll_ctl adding uevent_fd failed; errno=%d", errno);
+    return;
   }
 
-  while (!destroyThread) {
+  mEventFd = unique_fd(eventfd(0, 0));
+  if (mEventFd == -1) {
+    ALOGE("eventfd failed; errno=%d\n", errno);
+    return;
+  }
+
+  ev.events = EPOLLIN;
+  ev.data.fd = mEventFd.get();
+  if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, mEventFd, &ev) == -1) {
+    ALOGE("epoll_ctl adding event_fd failed; errno=%d", errno);
+    mEventFd.reset();
+    return;
+  }
+
+  bool running = true;
+  while (running) {
     struct epoll_event events[64];
 
     nevents = epoll_wait(epoll_fd, events, 64, -1);
@@ -783,28 +757,20 @@ static void *work(void *param) {
     }
 
     for (int n = 0; n < nevents; ++n) {
-      if (events[n].data.ptr)
-        (*(void (*)(uint32_t, struct data *payload))events[n].data.ptr)(
-            events[n].events, &payload);
+      if (events[n].data.fd == uevent_fd.get()) {
+        uevent_event(uevent_fd, this);
+      } else {
+        eventfd_t val;
+        ALOGI("eventfd notified");
+        if (eventfd_read(mEventFd, &val) == 0)
+          running = false;
+        break;
+      }
     }
   }
 
   ALOGI("exiting worker thread");
-error:
-  close(uevent_fd);
-
-  if (epoll_fd >= 0) close(epoll_fd);
-
-  return NULL;
-}
-
-static void sighandler(int sig) {
-  if (sig == SIGUSR1) {
-    destroyThread = true;
-    ALOGI("destroy set");
-    return;
-  }
-  signal(SIGUSR1, sighandler);
+  mEventFd.reset();
 }
 
 Return<void> Usb::setCallback(const sp<V1_0::IUsbCallback> &callback) {
@@ -816,7 +782,7 @@ Return<void> Usb::setCallback(const sp<V1_0::IUsbCallback> &callback) {
       if (callback_V1_1 == NULL)
           ALOGI("Registering 1.0 callback");
 
-  pthread_mutex_lock(&mLock);
+  std::unique_lock lock(mLock); // unique_lock needed for explicit unlock
   /*
    * When both the old callback and new callback values are NULL,
    * there is no need to spin off the worker thread.
@@ -831,7 +797,6 @@ Return<void> Usb::setCallback(const sp<V1_0::IUsbCallback> &callback) {
      * when the callback is actually invoked.
      */
     mCallback_1_0 = callback;
-    pthread_mutex_unlock(&mLock);
     return Void();
   }
 
@@ -840,27 +805,25 @@ Return<void> Usb::setCallback(const sp<V1_0::IUsbCallback> &callback) {
 
   // Kill the worker thread if the new callback is NULL.
   if (mCallback_1_0 == NULL) {
-    pthread_mutex_unlock(&mLock);
-    if (!pthread_kill(mPoll, SIGUSR1)) {
-      pthread_join(mPoll, NULL);
-      ALOGI("pthread destroyed");
+    lock.unlock();
+    eventfd_t val = 1;
+    if (eventfd_write(mEventFd, val) == 0) {
+      mPoll.join();
+      ALOGI("worker thread destroyed");
     }
     return Void();
   }
 
-  destroyThread = false;
-  signal(SIGUSR1, sighandler);
+  if (mPoll.joinable()) {
+    ALOGE("worker thread still running; detaching...");
+    mPoll.detach();
+  }
 
   /*
    * Create a background thread if the old callback value is NULL
    * and being updated with a new value.
    */
-  if (pthread_create(&mPoll, NULL, work, this)) {
-    ALOGE("pthread creation failed %d", errno);
-    mCallback_1_0 = NULL;
-  }
-
-  pthread_mutex_unlock(&mLock);
+  mPoll = std::thread(&Usb::uevent_work, this);
 
   mIgnoreWakeup = checkUsbWakeupSupport();
   checkUsbInHostMode();
