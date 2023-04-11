@@ -1,59 +1,67 @@
-#ifndef ANDROID_HARDWARE_USB_V1_2_USB_H
-#define ANDROID_HARDWARE_USB_V1_2_USB_H
+/*
+ * Copyright (C) 2019-2021, The Linux Foundation. All rights reserved.
+ * Not a Contribution.
+ *
+ * Copyright (C) 2017 The Android Open Source Project
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *
+ * Changes from Qualcomm Innovation Center are provided under the following license:
+ * Copyright (c) 2023 Qualcomm Innovation Center, Inc. All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause-Clear
+ */
 
-#include <android/hardware/usb/1.2/IUsb.h>
-#include <android/hardware/usb/1.2/types.h>
-#include <android/hardware/usb/1.2/IUsbCallback.h>
-#include <hidl/Status.h>
-#include <utils/Log.h>
-#include <android-base/properties.h>
-#include <android-base/unique_fd.h>
+#ifndef ANDROID_HARDWARE_USB_QTI_USB_H
+#define ANDROID_HARDWARE_USB_QTI_USB_H
+
+#include <aidl/android/hardware/usb/BnUsb.h>
+#include <aidl/android/hardware/usb/BnUsbCallback.h>
 #include <condition_variable>
 #include <mutex>
 #include <thread>
+#include <utils/Log.h>
+#include <android-base/unique_fd.h>
 
+namespace aidl {
 namespace android {
 namespace hardware {
 namespace usb {
-namespace V1_2 {
-namespace implementation {
 
-using ::android::hardware::usb::V1_0::PortRole;
-using ::android::hardware::usb::V1_0::PortRoleType;
-using ::android::hardware::usb::V1_0::PortDataRole;
-using ::android::hardware::usb::V1_0::PortPowerRole;
-using ::android::hardware::usb::V1_0::Status;
-using ::android::hardware::usb::V1_1::PortMode_1_1;
-using ::android::hardware::usb::V1_1::PortStatus_1_1;
-using ::android::hardware::usb::V1_2::ContaminantDetectionStatus;
-using ::android::hardware::usb::V1_2::ContaminantProtectionMode;
-using ::android::hardware::usb::V1_2::ContaminantProtectionStatus;
-using ::android::hardware::usb::V1_2::PortStatus;
-using ::android::hardware::usb::V1_2::IUsb;
-using ::android::hardware::usb::V1_2::IUsbCallback;
-using ::android::hidl::base::V1_0::DebugInfo;
-using ::android::hidl::base::V1_0::IBase;
-using ::android::hardware::hidl_array;
-using ::android::hardware::hidl_memory;
-using ::android::hardware::hidl_string;
-using ::android::hardware::hidl_vec;
-using ::android::hardware::Return;
-using ::android::hardware::Void;
-using ::android::base::SetProperty;
-using ::android::base::GetProperty;
-using ::android::base::unique_fd;
+using ::aidl::android::hardware::usb::IUsbCallback;
+using ::aidl::android::hardware::usb::PortRole;
 using ::android::sp;
+using ::android::base::unique_fd;
+using ::ndk::ScopedAStatus;
 
-struct Usb : public IUsb {
+struct Usb : public BnUsb {
     Usb();
 
-    Return<void> switchRole(const hidl_string& portName, const V1_0::PortRole& role) override;
-    Return<void> setCallback(const sp<V1_0::IUsbCallback>& callback) override;
-    Return<void> queryPortStatus() override;
-    Return<void> enableContaminantPresenceProtection(const hidl_string &portName, bool enable) override;
-    Return<void> enableContaminantPresenceDetection(const hidl_string &portName, bool enable) override;
+    ScopedAStatus enableContaminantPresenceDetection(const std::string& in_portName,
+            bool in_enable, int64_t in_transactionId) override;
+    ScopedAStatus enableUsbData(const std::string& in_portName, bool in_enable,
+            int64_t in_transactionId) override;
+    ScopedAStatus enableUsbDataWhileDocked(const std::string& in_portName,
+            int64_t in_transactionId) override;
+    ScopedAStatus queryPortStatus(int64_t in_transactionId) override;
+    ScopedAStatus setCallback(const std::shared_ptr<IUsbCallback>& in_callback) override;
+    ScopedAStatus switchRole(const std::string& in_portName, const PortRole& in_role,
+            int64_t in_transactionId) override;
+    ScopedAStatus limitPowerTransfer(const std::string& in_portName, bool in_limit,
+            int64_t in_transactionId) override;
+    ScopedAStatus resetUsbPort(const std::string& in_portName,
+            int64_t in_transactionId) override;
 
-    sp<V1_0::IUsbCallback> mCallback_1_0;
+    std::shared_ptr<IUsbCallback> mCallback;
     // Protects mCallback variable
     std::mutex mLock;
     // Protects roleSwitch operation
@@ -80,14 +88,13 @@ struct Usb : public IUsb {
   private:
     std::thread mPoll;
     unique_fd mEventFd;
+    bool switchMode(const std::string &portName, const PortRole &newRole);
     void uevent_work();
-    bool switchMode(const hidl_string &portName, const PortRole &newRole);
 };
 
-}  // namespace implementation
-}  // namespace V1_2
 }  // namespace usb
 }  // namespace hardware
 }  // namespace android
+}  // namespace aidl
 
-#endif  // ANDROID_HARDWARE_USB_V1_2_USB_H
+#endif  // ANDROID_HARDWARE_USB_QTI_USB_H

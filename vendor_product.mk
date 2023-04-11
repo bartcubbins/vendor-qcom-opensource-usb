@@ -34,7 +34,7 @@ else
 endif
 
 ifneq ($(TARGET_KERNEL_VERSION),$(filter $(TARGET_KERNEL_VERSION),4.9 4.14))
-  PRODUCT_PACKAGES += android.hardware.usb@1.2-service-qti
+  PRODUCT_PACKAGES += android.hardware.usb-service.qti
 endif
 
 USB_USES_QMAA = $(TARGET_USES_QMAA)
