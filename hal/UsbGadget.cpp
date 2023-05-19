@@ -171,16 +171,16 @@ ScopedAStatus UsbGadget::getUsbSpeed(const shared_ptr<IUsbGadgetCallback> &callb
 }
 
 Status UsbGadget::tearDownGadget() {
+  if (mMonitorFfs.isMonitorRunning())
+    mMonitorFfs.reset();
+  else
+    ALOGE("mMonitor not running");
+
   if (resetGadget() != ::android::hardware::usb::gadget::V1_0::Status::SUCCESS)
     return Status::ERROR;
 
   if (remove(OS_DESC_PATH))
     ALOGI("Unable to remove file %s errno:%d", OS_DESC_PATH, errno);
-
-  if (mMonitorFfs.isMonitorRunning())
-    mMonitorFfs.reset();
-  else
-    ALOGE("mMonitor not running");
 
   return Status::SUCCESS;
 }
