@@ -71,9 +71,6 @@ static void checkUsbInHostMode();
 static void checkUsbDeviceAutoSuspend(const std::string& devicePath);
 static bool checkUsbInterfaceAutoSuspend(const std::string& devicePath,
         const std::string &intf);
-static bool isAudioClass(const std::string& devicePath,
-        const std::string &intf);
-static bool isRootHub(const std::string& devicePath);
 
 ScopedAStatus Usb::enableUsbData(const std::string& in_portName, bool in_enable,
     int64_t in_transactionId) {
@@ -601,30 +598,10 @@ static void handle_psy_uevent(Usb *usb, const char *msg)
   }
 }
 
-// USB audio device disconnect monitor
-void disconnectMon(struct Usb *usb) {
-  std::string devicePath = usb->audioDev;
-  int timeout = 300, ret;
-
-  while (usb->monDisconnect) {
-    if (!timeout) {
-      ALOGI("disconnectMon timed out, deauthorizing");
-      ret = WriteStringToFile("0", devicePath + "/../authorized");
-      if (!ret)
-        ALOGI("unable to deauthorize device");
-      break;
-    }
-    timeout--;
-    std::this_thread::sleep_for(std::chrono::milliseconds(1));
-  }
-
-  return;
-}
-
 static void uevent_event(const unique_fd &uevent_fd, struct Usb *usb) {
   constexpr int UEVENT_MSG_LEN = 2048;
   char msg[UEVENT_MSG_LEN + 2];
-  int n;
+  int n, ret;
   std::string dwc3_sysfs;
 
   std::string gadgetName = GetProperty(USB_CONTROLLER_PROP, "");
@@ -634,7 +611,7 @@ static void uevent_event(const unique_fd &uevent_fd, struct Usb *usb) {
                               "usb\\d)/\\d-\\d(?:/[\\d\\.-]+)*)");
   static std::regex bind_regex("bind@(/devices/platform/soc/.*dwc3/xhci-hcd\\.\\d\\.auto/"
                                "usb\\d/\\d-\\d(?:/[\\d\\.-]+)*)/([^/]*:[^/]*)");
-  static std::regex unbind_regex("unbind@(/devices/platform/soc/.*dwc3/xhci-hcd\\.\\d\\.auto/"
+  static std::regex bus_reset_regex("change@(/devices/platform/soc/.*dwc3/xhci-hcd\\.\\d\\.auto/"
                                "usb\\d/\\d-\\d(?:/[\\d\\.-]+)*)/([^/]*:[^/]*)");
   static std::regex udc_regex("(add|remove)@/devices/platform/soc/.*/" + gadgetName +
                               "/udc/" + gadgetName);
@@ -650,7 +627,6 @@ static void uevent_event(const unique_fd &uevent_fd, struct Usb *usb) {
   msg[n + 1] = '\0';
 
   std::cmatch match;
-
   if (strstr(msg, "typec/port")) {
     handle_typec_uevent(usb, msg);
   } else if (strstr(msg, "power_supply/usb")) {
@@ -660,23 +636,11 @@ static void uevent_event(const unique_fd &uevent_fd, struct Usb *usb) {
       std::csub_match submatch = match[1];
       checkUsbDeviceAutoSuspend("/sys" +  submatch.str());
     }
-  } else if (std::regex_match(msg, match, bind_regex)) {
-    std::csub_match devpath = match[1];
-    std::csub_match intfpath = match[2];
-    std::string dpath;
-
-    if (!usb->mIgnoreWakeup) {
-        if (match.size() == 3) {
-          checkUsbInterfaceAutoSuspend("/sys" + devpath.str(), intfpath.str());
-        }
-    }
-
-    dpath.assign("/sys" + devpath.str());
-    // Limit the audio path recovery to devices directly connected to the root hub.
-    // Save the device path to the audio device, which will trigger the recovery.
-    if (usb->audioDev == "" && isAudioClass(dpath, intfpath.str()) && isRootHub(dpath)) {
-       usb->audioDev.assign(dpath);
-       usb->armResetRecovery = true;
+  } else if (!usb->mIgnoreWakeup && std::regex_match(msg, match, bind_regex)) {
+    if (match.size() == 3) {
+      std::csub_match devpath = match[1];
+      std::csub_match intfpath = match[2];
+      checkUsbInterfaceAutoSuspend("/sys" + devpath.str(), intfpath.str());
     }
   } else if (std::regex_match(msg, match, udc_regex)) {
     if (!strncmp(msg, "add", 3)) {
@@ -707,36 +671,31 @@ static void uevent_event(const unique_fd &uevent_fd, struct Usb *usb) {
 		 sleep(1);
 		 WriteStringToFile("host", dwc3_sysfs);
 	 }
- } else if (std::regex_match(msg, match, unbind_regex)) {
+ } else if (std::regex_match(msg, match, bus_reset_regex)) {
     std::csub_match devpath = match[1];
     std::csub_match intfpath = match[2];
-    std::string dpath;
 
-    dpath.assign("/sys" + devpath.str());
+    ALOGI("Handling USB bus reset recovery");
+
     // Limit the recovery to when an audio device is connected directly to
     // the roothub.  A path reference is needed so other non-audio class
     // related devices don't trigger the disconnectMon. (unbind uevent occurs
     // after sysfs files are cleaned, can't check bInterfaceClass)
-    if (usb->armResetRecovery && usb->audioDev == dpath) {
-        usb->monDisconnect = 1;
-        usb->armResetRecovery = false;
-        usb->mDisMon = std::thread(&disconnectMon, usb);
-    }
+    usb->usbResetRecov = 1;
+    ret = WriteStringToFile("0", "/sys" + devpath.str() + "/../authorized");
+    if (!ret)
+      ALOGI("unable to deauthorize device");
   } else if (std::regex_match(msg, match, remove_regex)) {
     std::csub_match devpath = match[1];
     std::csub_match parentpath = match[2];
-    std::string dpath;
 
-    dpath.assign("/sys" + devpath.str());
     ALOGI("Disconnect received");
-    if (usb->monDisconnect) {
-      usb->monDisconnect = 0;
-      usb->mDisMon.join();
+    if (usb->usbResetRecov) {
+      usb->usbResetRecov = 0;
+      //Allow interfaces to disconnect
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
       WriteStringToFile("1", "/sys" + parentpath.str() + "/authorized");
     }
-    if (usb->audioDev == dpath)
-      usb->audioDev = "";
-    usb->armResetRecovery = false;
   }
 }
 
@@ -977,29 +936,6 @@ static int getDeviceInterfaceClass(const std::string& devicePath,
     return -1;
 
   return std::stoi(bInterfaceClass, 0, 16);
-}
-
-static bool isRootHub(const std::string& devicePath) {
-  std::string devpath;
-  int path;
-  bool ret;
-
-  ret = ReadFileToString(devicePath + "/../devpath", &devpath);
-  if (!ret || devpath.length() == 0)
-    return false;
-
-  path = std::stoi(devpath, 0, 16);
-
-  return !path;
-}
-
-static bool isAudioClass(const std::string& devicePath,
-        const std::string &intf) {
-  int interfaceClass, ret = -1;
-
-  interfaceClass = getDeviceInterfaceClass(devicePath, intf);
-
-  return (interfaceClass == USB_CLASS_AUDIO);
 }
 
 /*
