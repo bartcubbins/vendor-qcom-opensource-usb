@@ -331,6 +331,12 @@ static Status validateAndSetVidPid(uint64_t functions) {
 	    GadgetFunction::AUDIO_SOURCE:
       ret = setVidPid("0x18d1", "0x2d05");
       break;
+    case static_cast<uint64_t>(GadgetFunction::NCM):
+      ret = setVidPid("0x18d1", "0x4eeb");
+      break;
+    case GadgetFunction::ADB | GadgetFunction::NCM:
+      ret = setVidPid("0x18d1", "0x4eec");
+      break;
     default:
       ALOGE("Combination not supported");
       ret = ::android::hardware::usb::gadget::V1_0::Status::CONFIGURATION_NOT_SUPPORTED;
@@ -352,17 +358,18 @@ Status UsbGadget::setupFunctions(
     return Status::ERROR;
   }
 
-  if ((functions & GadgetFunction::RNDIS) != 0) {
+  if (((functions & GadgetFunction::RNDIS) != 0) ||
+       ((functions & GadgetFunction::NCM) != 0)) {
     ALOGI("setCurrentUsbFunctions rndis");
-    std::string rndisComp = "rndis";
+    std::string tetherComp = (functions & GadgetFunction::RNDIS) ? "rndis" : "ncm";
 
     if (vendorExtraProp != "none")
-      rndisComp += "," + vendorExtraProp;
+      tetherComp += "," + vendorExtraProp;
 
     if (functions & GadgetFunction::ADB)
-      rndisComp += ",adb";
+      tetherComp += ",adb";
 
-    if (addFunctionsFromPropString(rndisComp, ffsEnabled, i))
+    if (addFunctionsFromPropString(tetherComp, ffsEnabled, i))
       return Status::ERROR;
   } else if (functions == static_cast<uint64_t>(GadgetFunction::ADB) &&
       !vendorProp.empty() && vendorProp != "adb") {
