@@ -1020,11 +1020,71 @@ ScopedAStatus Usb::limitPowerTransfer(const std::string& in_portName, bool in_li
 
 ScopedAStatus Usb::resetUsbPort(const std::string& in_portName, int64_t in_transactionId) {
   std::scoped_lock lock(mLock);
+  std::string dwcDriver = "/sys/bus/platform/drivers/msm-dwc3/";
+  std::string controllerName = GetProperty(USB_CONTROLLER_PROP, "");
+  aidl::android::hardware::usb::Status status = Status::SUCCESS;
+  std::string entry = "";
+  std::string mode;
+  struct dirent *deviceDir;
+  std::size_t idx;
+  DIR *gd;
+  int ret = -1;
+
+  ALOGI("resetUsbPort %s", in_portName.c_str());
+  //Fetch controller address from vendor prop
+  idx = controllerName.find(".");
+  controllerName = controllerName.substr(0, idx);
+
+  gd = opendir(dwcDriver.c_str());
+  if (gd != NULL) {
+    //Search for soft link to device
+    while ((deviceDir = readdir(gd))) {
+      if (deviceDir->d_type == DT_LNK &&
+          strstr(deviceDir->d_name, controllerName.c_str())) {
+        entry = deviceDir->d_name;
+        dwcDriver += entry + "/";
+      }
+    }
+    closedir(gd);
+
+    if (entry == "") {
+      ALOGE("resetUsbPort unable to find dwc device");
+      status = Status::ERROR;
+      goto out;
+    }
+
+    //Cache current mode for re-writing after the reset
+    ret = ReadFileToString(dwcDriver + "mode", &mode);
+    if (!ret) {
+      status = Status::ERROR;
+      goto out;
+    }
+
+    //Don't handle the port reset if we are disconnected
+    if (mode == "none")
+      goto out;
+
+    //Toggle mode sysfs to trigger disconnect/connect sequence
+    ret = WriteStringToFile("none", dwcDriver + "mode");
+    if (!ret) {
+      status = Status::ERROR;
+      goto out;
+    }
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    ret = WriteStringToFile(mode.c_str(), dwcDriver + "mode");
+    if (!ret) {
+      status = Status::ERROR;
+      goto out;
+    }
+  }
+
+out:
   if (mCallback) {
-    ScopedAStatus ret = mCallback->notifyResetUsbPortStatus(in_portName,
-        Status::NOT_SUPPORTED, in_transactionId);
-    if (!ret.isOk())
-      ALOGE("notifyResetUsbPortStatus error %s", ret.getDescription().c_str());
+    ScopedAStatus stat = mCallback->notifyResetUsbPortStatus(in_portName,
+        status, in_transactionId);
+    if (!stat.isOk())
+      ALOGE("notifyResetUsbPortStatus error %s", stat.getDescription().c_str());
   } else {
     ALOGE("Not notifying the userspace. Callback is not set");
   }
