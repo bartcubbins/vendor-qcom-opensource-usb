@@ -60,6 +60,8 @@ struct Usb : public BnUsb {
             int64_t in_transactionId) override;
     ScopedAStatus resetUsbPort(const std::string& in_portName,
             int64_t in_transactionId) override;
+    Status getPortStatusHelper(std::vector<PortStatus> &currentPortStatus,
+            const std::string &contaminantStatusPath);
 
     std::shared_ptr<IUsbCallback> mCallback;
     // Protects mCallback variable
@@ -86,6 +88,8 @@ struct Usb : public BnUsb {
     std::string mContaminantStatusPath;
     // USB bus reset recovery active
     int usbResetRecov;
+    // USB data disabled
+    bool usbDataDisabled;
 
   private:
     std::thread mPoll;

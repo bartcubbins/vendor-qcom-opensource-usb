@@ -72,14 +72,76 @@ static void checkUsbDeviceAutoSuspend(const std::string& devicePath);
 static bool checkUsbInterfaceAutoSuspend(const std::string& devicePath,
         const std::string &intf);
 
+static void getUsbControllerPath(std::string &controllerPath) {
+  std::string controllerName = GetProperty(USB_CONTROLLER_PROP, "");
+  std::string dwcDriver = "/sys/bus/platform/drivers/msm-dwc3/";
+  struct dirent *deviceDir;
+  std::string entry = "";
+  std::size_t idx;
+  DIR *gd;
+
+  //Fetch controller address from vendor prop
+  idx = controllerName.find(".");
+  controllerName = controllerName.substr(0, idx);
+  gd = opendir(dwcDriver.c_str());
+  if (gd != NULL) {
+    //Search for soft link to device
+    while ((deviceDir = readdir(gd))) {
+      if (deviceDir->d_type == DT_LNK &&
+          strstr(deviceDir->d_name, controllerName.c_str())) {
+        entry = deviceDir->d_name;
+        controllerPath += dwcDriver + entry + "/";
+        break;
+      }
+    }
+    closedir(gd);
+  }
+}
+
 ScopedAStatus Usb::enableUsbData(const std::string& in_portName, bool in_enable,
     int64_t in_transactionId) {
   std::scoped_lock lock(mLock);
+  aidl::android::hardware::usb::Status status = Status::SUCCESS;
+  std::string dwcDriver = "";
+  int ret;
+
+  ALOGI("enableUsbData in_enable: %d", in_enable);
+  getUsbControllerPath(dwcDriver);
+  if (dwcDriver == "") {
+    ALOGE("resetUsbPort unable to find dwc device");
+    status = Status::ERROR;
+    goto out;
+  }
+
+  if (!in_enable) {
+    ret = WriteStringToFile("1", dwcDriver + "dynamic_disable");
+    if (!ret) {
+      status = Status::ERROR;
+      goto out;
+    }
+  } else {
+    ret = WriteStringToFile("0", dwcDriver + "dynamic_disable");
+    if (!ret) {
+      status = Status::ERROR;
+      goto out;
+    }
+  }
+
+  usbDataDisabled = !in_enable;
+
+out:
   if (mCallback) {
-    ScopedAStatus ret = mCallback->notifyEnableUsbDataStatus(in_portName, true,
-        in_enable ? Status::SUCCESS : Status::NOT_SUPPORTED, in_transactionId);
+    std::vector<PortStatus> currentPortStatus;
+    ScopedAStatus ret = mCallback->notifyEnableUsbDataStatus(in_portName, in_enable,
+        status, in_transactionId);
     if (!ret.isOk())
       ALOGE("notifyEnableUsbDataStatus error %s", ret.getDescription().c_str());
+
+    status = getPortStatusHelper(currentPortStatus, mContaminantStatusPath);
+    ret = mCallback->notifyPortStatusChange(currentPortStatus,
+          status);
+    if (!ret.isOk())
+      ALOGE("queryPortStatus error %s", ret.getDescription().c_str());
   } else {
     ALOGE("Not notifying the userspace. Callback is not set");
   }
@@ -380,7 +442,7 @@ static bool canSwitchRoleHelper(const std::string &portName) {
   return false;
 }
 
-static Status getPortStatusHelper(std::vector<PortStatus> &currentPortStatus,
+Status Usb::getPortStatusHelper(std::vector<PortStatus> &currentPortStatus,
     const std::string &contaminantStatusPath) {
   auto names = getTypeCPortNamesHelper();
 
@@ -423,11 +485,13 @@ static Status getPortStatusHelper(std::vector<PortStatus> &currentPortStatus,
 
       status.supportedModes.push_back(PortMode::DRP);
       status.supportedModes.push_back(PortMode::AUDIO_ACCESSORY);
-      status.usbDataStatus.push_back(UsbDataStatus::ENABLED);
+      status.usbDataStatus.push_back(usbDataDisabled ? UsbDataStatus::DISABLED_FORCE :
+                                       UsbDataStatus::ENABLED);
 
-      ALOGI("%d:%s connected:%d canChangeMode:%d canChangeData:%d canChangePower:%d",
+      ALOGI("%d:%s connected:%d canChangeMode:%d canChangeData:%d canChangePower:%d "
+            "usbDataDisabled:%d",
             i, portName.c_str(), connected, status.canChangeMode,
-            status.canChangeDataRole, status.canChangePowerRole);
+            status.canChangeDataRole, status.canChangePowerRole, usbDataDisabled);
 
       status.supportsEnableContaminantPresenceProtection = false;
       status.supportsEnableContaminantPresenceDetection = false;
@@ -537,7 +601,7 @@ static void handle_typec_uevent(Usb *usb, const char *msg)
   {
     std::scoped_lock lock(usb->mLock);
     if (usb->mCallback) {
-      Status status = getPortStatusHelper(currentPortStatus, usb->mContaminantStatusPath);
+      Status status = usb->getPortStatusHelper(currentPortStatus, usb->mContaminantStatusPath);
       ScopedAStatus ret = usb->mCallback->notifyPortStatusChange(currentPortStatus, status);
       if (!ret.isOk())
         ALOGE("notifyPortStatusChange error %s", ret.getDescription().c_str());
@@ -590,7 +654,7 @@ static void handle_psy_uevent(Usb *usb, const char *msg)
 
     std::scoped_lock lock(usb->mLock);
     if (usb->mCallback) {
-      Status status = getPortStatusHelper(currentPortStatus, usb->mContaminantStatusPath);
+      Status status = usb->getPortStatusHelper(currentPortStatus, usb->mContaminantStatusPath);
       ScopedAStatus ret = usb->mCallback->notifyPortStatusChange(currentPortStatus, status);
       if (!ret.isOk())
         ALOGE("notifyPortStatusChange error %s", ret.getDescription().c_str());
@@ -1020,63 +1084,43 @@ ScopedAStatus Usb::limitPowerTransfer(const std::string& in_portName, bool in_li
 
 ScopedAStatus Usb::resetUsbPort(const std::string& in_portName, int64_t in_transactionId) {
   std::scoped_lock lock(mLock);
-  std::string dwcDriver = "/sys/bus/platform/drivers/msm-dwc3/";
-  std::string controllerName = GetProperty(USB_CONTROLLER_PROP, "");
   aidl::android::hardware::usb::Status status = Status::SUCCESS;
-  std::string entry = "";
+  std::string dwcDriver = "";
   std::string mode;
-  struct dirent *deviceDir;
-  std::size_t idx;
-  DIR *gd;
   int ret = -1;
 
-  ALOGI("resetUsbPort %s", in_portName.c_str());
-  //Fetch controller address from vendor prop
-  idx = controllerName.find(".");
-  controllerName = controllerName.substr(0, idx);
+  ALOGE("resetUsbPort %s", in_portName.c_str());
 
-  gd = opendir(dwcDriver.c_str());
-  if (gd != NULL) {
-    //Search for soft link to device
-    while ((deviceDir = readdir(gd))) {
-      if (deviceDir->d_type == DT_LNK &&
-          strstr(deviceDir->d_name, controllerName.c_str())) {
-        entry = deviceDir->d_name;
-        dwcDriver += entry + "/";
-      }
-    }
-    closedir(gd);
+  getUsbControllerPath(dwcDriver);
+  if (dwcDriver == "") {
+    ALOGE("resetUsbPort unable to find dwc device");
+    status = Status::ERROR;
+    goto out;
+  }
 
-    if (entry == "") {
-      ALOGE("resetUsbPort unable to find dwc device");
-      status = Status::ERROR;
-      goto out;
-    }
+  //Cache current mode for re-writing after the reset
+  ret = ReadFileToString(dwcDriver + "mode", &mode);
+  if (!ret) {
+    status = Status::ERROR;
+    goto out;
+  }
 
-    //Cache current mode for re-writing after the reset
-    ret = ReadFileToString(dwcDriver + "mode", &mode);
-    if (!ret) {
-      status = Status::ERROR;
-      goto out;
-    }
+  //Don't handle the port reset if we are disconnected
+  if (mode == "none")
+    goto out;
 
-    //Don't handle the port reset if we are disconnected
-    if (mode == "none")
-      goto out;
+  //Toggle mode sysfs to trigger disconnect/connect sequence
+  ret = WriteStringToFile("none", dwcDriver + "mode");
+  if (!ret) {
+    status = Status::ERROR;
+    goto out;
+  }
 
-    //Toggle mode sysfs to trigger disconnect/connect sequence
-    ret = WriteStringToFile("none", dwcDriver + "mode");
-    if (!ret) {
-      status = Status::ERROR;
-      goto out;
-    }
-
-    std::this_thread::sleep_for(std::chrono::milliseconds(300));
-    ret = WriteStringToFile(mode.c_str(), dwcDriver + "mode");
-    if (!ret) {
-      status = Status::ERROR;
-      goto out;
-    }
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  ret = WriteStringToFile(mode.c_str(), dwcDriver + "mode");
+  if (!ret) {
+    status = Status::ERROR;
+    goto out;
   }
 
 out:
