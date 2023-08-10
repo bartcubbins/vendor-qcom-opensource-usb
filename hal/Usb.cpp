@@ -488,10 +488,13 @@ Status Usb::getPortStatusHelper(std::vector<PortStatus> &currentPortStatus,
       status.usbDataStatus.push_back(usbDataDisabled ? UsbDataStatus::DISABLED_FORCE :
                                        UsbDataStatus::ENABLED);
 
+      status.powerTransferLimited = limitedPower;
+
       ALOGI("%d:%s connected:%d canChangeMode:%d canChangeData:%d canChangePower:%d "
-            "usbDataDisabled:%d",
+            "usbDataDisabled:%d, powerTransferLimited:%d",
             i, portName.c_str(), connected, status.canChangeMode,
-            status.canChangeDataRole, status.canChangePowerRole, usbDataDisabled);
+            status.canChangeDataRole, status.canChangePowerRole, usbDataDisabled,
+            limitedPower);
 
       status.supportsEnableContaminantPresenceProtection = false;
       status.supportsEnableContaminantPresenceDetection = false;
@@ -1070,11 +1073,45 @@ static bool checkUsbInterfaceAutoSuspend(const std::string& devicePath,
 ScopedAStatus Usb::limitPowerTransfer(const std::string& in_portName, bool in_limit,
     int64_t in_transactionId) {
   std::scoped_lock lock(mLock);
+  aidl::android::hardware::usb::Status status = Status::SUCCESS;
+  int ret;
+
+  ALOGI("limitPowerTransfer in_limit: %d", in_limit);
+
+  if (in_limit) {
+    ret = WriteStringToFile("0", "/sys/class/qcom-battery/restrict_cur");
+    if (!ret) {
+      ALOGE("failed to limit USB charge current");
+      status = Status::ERROR;
+    }
+
+    ret = WriteStringToFile("1", "/sys/class/qcom-battery/restrict_chg");
+    if (!ret) {
+      ALOGE("failed to limit USB charge current");
+      status = Status::ERROR;
+    }
+  } else {
+    ret = WriteStringToFile("0", "/sys/class/qcom-battery/restrict_chg");
+    if (!ret) {
+      ALOGE("failed to de-limit USB charge current");
+      status = Status::ERROR;
+    }
+  }
+
+  limitedPower = in_limit;
+
   if (mCallback && in_transactionId >= 0) {
+    std::vector<PortStatus> currentPortStatus;
     ScopedAStatus ret = mCallback->notifyLimitPowerTransferStatus(in_portName,
-        false, Status::NOT_SUPPORTED, in_transactionId);
+        in_limit, status, in_transactionId);
     if (!ret.isOk())
       ALOGE("limitPowerTransfer error %s", ret.getDescription().c_str());
+
+    status = getPortStatusHelper(currentPortStatus, mContaminantStatusPath);
+    ret = mCallback->notifyPortStatusChange(currentPortStatus,
+          status);
+    if (!ret.isOk())
+      ALOGE("queryPortStatus error %s", ret.getDescription().c_str());
   } else {
     ALOGE("Not notifying the userspace. Callback is not set");
   }

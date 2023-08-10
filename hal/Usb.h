@@ -90,6 +90,8 @@ struct Usb : public BnUsb {
     int usbResetRecov;
     // USB data disabled
     bool usbDataDisabled;
+    // Limit power transfer
+    bool limitedPower;
 
   private:
     std::thread mPoll;
