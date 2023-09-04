@@ -389,6 +389,8 @@ static Status getCurrentRoleHelper(const std::string &portName, bool connected,
       currentRole.set<PortRole::dataRole>(PortDataRole::DEVICE);
     else
       currentRole.set<PortRole::mode>(PortMode::UFP);
+  } else if (roleName == "dual") {
+     currentRole.set<PortRole::mode>(PortMode::DRP);
   } else if (roleName != "none") {
     /* case for none has already been addressed.
      * so we check if the role isn't none.
