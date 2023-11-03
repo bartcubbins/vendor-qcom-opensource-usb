@@ -719,8 +719,20 @@ static void uevent_event(const unique_fd &uevent_fd, struct Usb *usb) {
       // In case ADB is not enabled, we need to manually re-bind the UDC to
       // ConfigFS since ADBD is not there to trigger it (sys.usb.ffs.ready=1)
       if (GetProperty("init.svc.adbd", "") != "running") {
+        std::string udcName;
+        int retry = 5;
+
         ALOGI("Binding UDC %s to ConfigFS", gadgetName.c_str());
-        WriteStringToFile(gadgetName, "/config/usb_gadget/g1/UDC");
+
+        while (retry >= 0) {
+          WriteStringToFile(gadgetName, "/config/usb_gadget/g1/UDC");
+          ReadFileToString("/config/usb_gadget/g1/UDC", &udcName);
+          if (Trim(udcName) == gadgetName)
+            break;
+          ALOGI("Retrying UDC bind for %s", gadgetName.c_str());
+          std::this_thread::sleep_for(std::chrono::milliseconds(50));
+          retry--;
+        }
       }
     } else {
       // When the UDC is removed, the ConfigFS gadget will no longer be
