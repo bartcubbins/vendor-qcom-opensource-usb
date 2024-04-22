@@ -214,7 +214,7 @@ static std::map<std::string, std::function<std::string()> > supported_funcs {
   { "dpl",              [](){ return GetProperty(RMNET_FUNC_NAME_PROP, "gsi") + "." + GetProperty(DPL_INST_NAME_PROP, "dpl"); } },
   { "mass_storage",     [](){ return "mass_storage.0"; } },
   { "mtp",              [](){ return "ffs.mtp"; } },
-  { "ncm",              [](){ return "ncm.0"; } },
+  { "ncm",              [](){ return "ncm.gs6"; } },
   { "ptp",              [](){ return "ffs.ptp"; } },
   { "qdss",             [](){ return qdssFuncname("0"); } },
   { "qdss_debug",       [](){ return qdssFuncname("1"); } },
