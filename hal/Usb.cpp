@@ -17,7 +17,7 @@
  * limitations under the License.
  *
  * Changes from Qualcomm Innovation Center are provided under the following license:
- * Copyright (c) 2023 Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) 2023-2024 Qualcomm Innovation Center, Inc. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause-Clear
  */
 
@@ -51,6 +51,7 @@
 #define VENDOR_USB_ADB_DISABLED_PROP "vendor.sys.usb.adb.disabled"
 #define USB_CONTROLLER_PROP "vendor.usb.controller"
 #define USB_MODE_PATH "/sys/bus/platform/devices/"
+#define USB_UDC_PATH "/sys/class/udc"
 
 namespace aidl {
 namespace android {
@@ -741,7 +742,26 @@ static void uevent_event(const unique_fd &uevent_fd, struct Usb *usb) {
       // just keep repeating this in a 1 second retry loop. Each iteration
       // will re-trigger a ConfigFS UDC bind which will keep failing.
       // Setting this property stops ADBD from proceeding with the retry.
-      SetProperty(VENDOR_USB_ADB_DISABLED_PROP, "1");
+
+      DIR *dir = opendir(USB_UDC_PATH);
+      bool udc_found = false;
+
+      // enumerate /sys/class/udc/* to see if any UDCs still exist
+      if (dir != NULL) {
+	      struct dirent *entity;
+
+	      while ((entity = readdir(dir))) {
+		      if (entity->d_type == DT_LNK){
+			      udc_found = true;
+			      break;
+		      }
+	      }
+	      closedir(dir);
+      }
+
+      if (!udc_found)
+	      SetProperty(VENDOR_USB_ADB_DISABLED_PROP, "1");
+
     }
   }  else if (std::regex_match(msg, match, offline_regex)) {
 	 if(std::regex_search (msg, match, dwc3_regex))
