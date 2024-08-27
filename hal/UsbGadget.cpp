@@ -222,6 +222,7 @@ static std::map<std::string, std::function<std::string()> > supported_funcs {
   { "rmnet",            [](){ return GetProperty(RMNET_FUNC_NAME_PROP, "gsi") + "." + GetProperty(RMNET_INST_NAME_PROP, "rmnet"); } },
   { "rndis",            rndisFuncname },
   { "serial_cdev",      [](){ return "cser.dun.0"; } },
+  { "serial_cdev_nmea", [](){ return "cser.nmea.1"; } },
   { "serial_cdev_mdm",  [](){ return "cser.dun.2"; } },
   { "uac2",             [](){ return "uac2.0"; } },
   { "uvc",              [](){ return "uvc.0"; } },
