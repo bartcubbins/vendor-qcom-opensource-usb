@@ -763,15 +763,6 @@ static void uevent_event(const unique_fd &uevent_fd, struct Usb *usb) {
 	      SetProperty(VENDOR_USB_ADB_DISABLED_PROP, "1");
 
     }
-  }  else if (std::regex_match(msg, match, offline_regex)) {
-	 if(std::regex_search (msg, match, dwc3_regex))
-	 {
-		 dwc3_sysfs = USB_MODE_PATH + match.str(1) + "/mode";
-		 ALOGE("ERROR:restarting in host mode");
-		 WriteStringToFile("none", dwc3_sysfs);
-		 sleep(1);
-		 WriteStringToFile("host", dwc3_sysfs);
-	 }
  } else if (std::regex_match(msg, match, bus_reset_regex)) {
     std::csub_match devpath = match[1];
     std::csub_match intfpath = match[2];
